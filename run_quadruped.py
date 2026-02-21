@@ -4,6 +4,7 @@
 Usage:
     python run_quadruped.py --x_vel 1.0 --y_vel 0.0 --ang_vel 0.5
     python run_quadruped.py --x_vel 1.0 --y_vel 1.0 --ang_vel -0.5 --output my_video.mp4
+    python run_quadruped.py --move_to_ball --output ball_chase.mp4
 """
 
 import argparse
@@ -392,32 +393,90 @@ envs.register_environment('barkour', BarkourEnv)
 
 
 # ---------------------------------------------------------------------------
-# Main script
+# Ball-tracking helper
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Run a trained Barkour quadruped policy and save a video.')
-    parser.add_argument('--x_vel', type=float, required=True,
-                        help='Target x (forward) velocity in m/s')
-    parser.add_argument('--y_vel', type=float, required=True,
-                        help='Target y (lateral) velocity in m/s')
-    parser.add_argument('--ang_vel', type=float, required=True,
-                        help='Target angular (yaw) velocity in rad/s')
-    parser.add_argument('--output', type=str, default='quadruped_rollout.mp4',
-                        help='Output video file path (default: quadruped_rollout.mp4)')
-    parser.add_argument('--model_path', type=str,
-                        default='/tmp/mjx_brax_quadruped_policy',
-                        help='Path to saved policy params')
-    parser.add_argument('--n_steps', type=int, default=500,
-                        help='Number of simulation steps (default: 500)')
-    parser.add_argument('--render_every', type=int, default=2,
-                        help='Render every N steps (default: 2)')
-    args = parser.parse_args()
+def compute_ball_command(
+    pipeline_state: base.State,
+    ball_xy: jax.Array,
+    k_lin: float = 2.0,
+    k_ang: float = 1.5,
+) -> jax.Array:
+    """Compute velocity command to steer the robot toward the ball.
 
-    print(f'Command: x_vel={args.x_vel}, y_vel={args.y_vel}, ang_vel={args.ang_vel}')
-    print(f'Model path: {args.model_path}')
-    print(f'Output: {args.output}')
+    Note: brax's ``mjcf.load`` fuses (removes) mocap bodies, so the ball
+    position cannot be read from ``pipeline_state.mocap_pos``.  Instead
+    the caller passes a fixed world-frame *ball_xy* position.
+
+    Args:
+        pipeline_state: Current simulation state.
+        ball_xy: (2,) ball position [x, y] in world frame.
+        k_lin: Proportional gain for linear velocity.
+        k_ang: Proportional gain for angular velocity.
+
+    Returns:
+        jax array [x_vel, y_vel, ang_vel] clamped to the training ranges.
+    """
+    # torso is body-index 0 in the brax state (world body stripped)
+    torso_pos = pipeline_state.x.pos[0, :2]
+    torso_rot = pipeline_state.x.rot[0]
+
+    # world-frame delta, projected into the robot's local frame
+    delta = ball_xy - torso_pos
+    delta_3d = jp.array([delta[0], delta[1], 0.0])
+    local_delta = math.rotate(delta_3d, math.quat_inv(torso_rot))
+
+    # heading error in the local frame
+    angle_to_ball = jp.arctan2(local_delta[1], local_delta[0])
+
+    # proportional controller, clamped to the ranges seen during training
+    x_vel = jp.clip(k_lin * local_delta[0], -0.6, 1.5)
+    y_vel = jp.clip(k_lin * local_delta[1], -0.8, 0.8)
+    ang_vel = jp.clip(k_ang * angle_to_ball, -0.7, 0.7)
+
+    return jp.array([x_vel, y_vel, ang_vel])
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def run_quadruped(
+    x_vel: float = 0.0,
+    y_vel: float = 0.0,
+    ang_vel: float = 0.0,
+    move_to_ball: bool = False,
+    ball_pos: tuple[float, float, float] = (1.0, 0.0, 0.1),
+    output: str = 'quadruped_rollout.mp4',
+    model_path: str = '/tmp/mjx_brax_quadruped_policy',
+    n_steps: int = 500,
+    render_every: int = 2,
+) -> str:
+    """Run the trained Barkour quadruped policy and save a video.
+
+    Args:
+        x_vel: Target forward velocity in m/s (ignored when move_to_ball=True).
+        y_vel: Target lateral velocity in m/s (ignored when move_to_ball=True).
+        ang_vel: Target yaw velocity in rad/s (ignored when move_to_ball=True).
+        move_to_ball: If True, automatically compute velocity commands each
+            step to steer the robot toward the ball.
+        ball_pos: (x, y, z) world-frame position of the ball target.
+            Defaults to (1, 0, 0.1) which matches the red_ball in the
+            scene XML.  Only used when *move_to_ball* is True.
+        output: Output video file path.
+        model_path: Path to saved policy params.
+        n_steps: Number of simulation steps.
+        render_every: Render every N steps.
+
+    Returns:
+        The path to the saved video file.
+    """
+    if move_to_ball:
+        print(f'Mode: move_to_ball  target={ball_pos}')
+    else:
+        print(f'Command: x_vel={x_vel}, y_vel={y_vel}, ang_vel={ang_vel}')
+    print(f'Model path: {model_path}')
+    print(f'Output: {output}')
 
     # 1. Create the environment
     env = envs.get_environment('barkour')
@@ -433,35 +492,91 @@ def main():
 
     # 3. Create the inference function and load saved params
     make_policy = ppo_networks.make_inference_fn(ppo_network)
-    params = model.load_params(args.model_path)
+    params = model.load_params(model_path)
     inference_fn = make_policy(params)
     jit_inference_fn = jax.jit(inference_fn)
 
-    # 4. Run a rollout with the specified velocity command
+    # 4. Run a rollout
     jit_reset = jax.jit(env.reset)
     jit_step = jax.jit(env.step)
 
-    the_command = jp.array([args.x_vel, args.y_vel, args.ang_vel])
-
     rng = jax.random.PRNGKey(0)
     state = jit_reset(rng)
-    state.info['command'] = the_command
+
+    # set initial velocity command
+    ball_xy = jp.array([ball_pos[0], ball_pos[1]])  # only x,y needed
+    if move_to_ball:
+        state.info['command'] = compute_ball_command(
+            state.pipeline_state, ball_xy)
+    else:
+        state.info['command'] = jp.array([x_vel, y_vel, ang_vel])
+
     rollout = [state.pipeline_state]
 
-    print(f'Running simulation for {args.n_steps} steps...')
-    for i in range(args.n_steps):
+    print(f'Running simulation for {n_steps} steps...')
+    for i in range(n_steps):
         act_rng, rng = jax.random.split(rng)
         ctrl, _ = jit_inference_fn(state.obs, act_rng)
         state = jit_step(state, ctrl)
+
+        # recompute command every step when tracking the ball
+        if move_to_ball:
+            state.info['command'] = compute_ball_command(
+                state.pipeline_state, ball_xy)
+
         rollout.append(state.pipeline_state)
 
     # 5. Render and save video
     print('Rendering video...')
-    frames = env.render(rollout[::args.render_every], camera='track')
-    fps = 1.0 / env.dt / args.render_every
+    frames = env.render(rollout[::render_every], camera='track')
+    fps = 1.0 / env.dt / render_every
 
-    media.write_video(args.output, frames, fps=fps)
-    print(f'Video saved to {args.output}')
+    media.write_video(output, frames, fps=fps)
+    print(f'Video saved to {output}')
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Run a trained Barkour quadruped policy and save a video.')
+    parser.add_argument('--x_vel', type=float, default=0.0,
+                        help='Target x (forward) velocity in m/s (default: 0.0)')
+    parser.add_argument('--y_vel', type=float, default=0.0,
+                        help='Target y (lateral) velocity in m/s (default: 0.0)')
+    parser.add_argument('--ang_vel', type=float, default=0.0,
+                        help='Target angular (yaw) velocity in rad/s (default: 0.0)')
+    parser.add_argument('--move_to_ball', action='store_true',
+                        help='Automatically steer toward the red ball in the scene')
+    parser.add_argument('--ball_pos', type=float, nargs=3, default=[1.0, 0.0, 0.1],
+                        metavar=('X', 'Y', 'Z'),
+                        help='Ball position in world frame (default: 1.0 0.0 0.1)')
+    parser.add_argument('--output', type=str, default='quadruped_rollout.mp4',
+                        help='Output video file path (default: quadruped_rollout.mp4)')
+    parser.add_argument('--model_path', type=str,
+                        default='/tmp/mjx_brax_quadruped_policy',
+                        help='Path to saved policy params')
+    parser.add_argument('--n_steps', type=int, default=500,
+                        help='Number of simulation steps (default: 500)')
+    parser.add_argument('--render_every', type=int, default=2,
+                        help='Render every N steps (default: 2)')
+    args = parser.parse_args()
+
+    run_quadruped(
+        x_vel=args.x_vel,
+        y_vel=args.y_vel,
+        ang_vel=args.ang_vel,
+        move_to_ball=args.move_to_ball,
+        ball_pos=tuple(args.ball_pos),
+        output=args.output,
+        model_path=args.model_path,
+        n_steps=args.n_steps,
+        render_every=args.render_every,
+    )
 
 
 if __name__ == '__main__':
